@@ -22,10 +22,12 @@ type Cache interface {
 	ID() string
 	VersionSQL() string
 	RowSQL() string
+	Reset(pgx.Rows) error
 }
 
 type CachedVersionContainer struct {
 	Version string
+	Cache   Cache
 }
 
 type Registry struct {
@@ -37,6 +39,29 @@ type Registry struct {
 
 type CacheVersion struct {
 	Version string
+}
+
+func (r *Registry) rebuildCache(cache Cache, version string) {
+	// fetch all rows
+	rows, err := r.conn.Query(context.Background(), cache.RowSQL())
+	if err != nil {
+		fmt.Println("Error querying cache rows for cache ID:", cache.ID(), "error:", err)
+		return
+	}
+	defer rows.Close()
+
+	// TODO: We may want to retry this
+	err = cache.Reset(rows)
+	if err != nil {
+		fmt.Println("Error resetting cache for cache ID:", cache.ID(), "error:", err)
+		return
+	}
+
+	// Update the cached version
+	r.cachedVersionContainers[cache.ID()] = CachedVersionContainer{
+		Version: version,
+		Cache:   cache,
+	}
 }
 
 func (r *Registry) refreshCache(cache Cache) {
@@ -57,35 +82,7 @@ func (r *Registry) refreshCache(cache Cache) {
 	if !exists || currentCachedVersionContainer.Version != version {
 		fmt.Println("Cache ID:", cache.ID(), "is stale or missing, refreshing...", exists, "current version:", currentCachedVersionContainer.Version, "new version:", version)
 
-		// fetch all rows
-		rows, err := r.conn.Query(context.Background(), cache.RowSQL())
-		if err != nil {
-			fmt.Println("Error querying cache rows for cache ID:", cache.ID(), "error:", err)
-			return
-		}
-		defer rows.Close()
-
-		// Process rows as needed to refresh the cache
-		// For demonstration, we'll just print the rows
-		for rows.Next() {
-			// Assuming the row has a single string column for simplicity
-			var data string
-			if err := rows.Scan(&data); err != nil {
-				fmt.Println("Error scanning row for cache ID:", cache.ID(), "error:", err)
-				return
-			}
-			fmt.Println("Cache ID:", cache.ID(), "row data:", data)
-		}
-
-		if err := rows.Err(); err != nil {
-			fmt.Println("Error iterating rows for cache ID:", cache.ID(), "error:", err)
-			return
-		}
-
-		// Update the cached version
-		r.cachedVersionContainers[cache.ID()] = CachedVersionContainer{
-			Version: version,
-		}
+		r.rebuildCache(cache, version)
 
 		fmt.Println("Cache ID:", cache.ID(), "refreshed successfully.")
 	} else {
