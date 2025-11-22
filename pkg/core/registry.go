@@ -3,25 +3,161 @@ package core
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
-func NewRegistry(c *pgx.Conn) *Registry {
+const (
+	// DefaultRefreshInterval is the default time between cache refresh cycles.
+	DefaultRefreshInterval = 10 * time.Second
+)
+
+// SafeMap provides thread-safe access to a map.
+// Consumers should use this to store their cache data to avoid race conditions.
+type SafeMap[K comparable, V any] struct {
+	mu   sync.RWMutex
+	data map[K]V
+}
+
+// NewSafeMap creates a new thread-safe map.
+func NewSafeMap[K comparable, V any]() *SafeMap[K, V] {
+	return &SafeMap[K, V]{
+		data: make(map[K]V),
+	}
+}
+
+// Set stores a value in the map.
+func (sm *SafeMap[K, V]) Set(key K, value V) {
+	sm.mu.Lock()
+	sm.data[key] = value
+	sm.mu.Unlock()
+}
+
+// Get retrieves a value from the map.
+func (sm *SafeMap[K, V]) Get(key K) (V, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	val, ok := sm.data[key]
+	return val, ok
+}
+
+// SetAll replaces all data in the map with the provided map.
+// This is useful for cache Reset operations.
+func (sm *SafeMap[K, V]) SetAll(newData map[K]V) {
+	sm.mu.Lock()
+	sm.data = newData
+	sm.mu.Unlock()
+}
+
+// GetAll returns a copy of all data in the map.
+func (sm *SafeMap[K, V]) GetAll() map[K]V {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	result := make(map[K]V, len(sm.data))
+	for k, v := range sm.data {
+		result[k] = v
+	}
+	return result
+}
+
+// Len returns the number of items in the map.
+func (sm *SafeMap[K, V]) Len() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.data)
+}
+
+// NewRegistry creates a new cache registry.
+// If logger is nil, a default logger will be used.
+func NewRegistry(c *pgx.Conn, logger *slog.Logger) *Registry {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Registry{
 		cachedVersionContainers: make(map[string]CachedVersionContainer),
 		caches:                  []Cache{},
 		done:                    make(chan struct{}),
 		conn:                    c,
+		logger:                  logger,
 	}
 }
 
-// TODO: Extract this into a SQL cache interface
+// Cache represents a cacheable data structure that can be automatically refreshed
+// from PostgreSQL when the underlying data changes.
+//
+// Thread-safety: The Reset method will be called concurrently with reads from your
+// cache data structure. You MUST use synchronization (e.g., sync.RWMutex or the
+// provided SafeMap utility) to prevent race conditions.
+//
+// Example implementation:
+//
+//	type UserCache struct {
+//	    users *core.SafeMap[int, User]
+//	}
+//
+//	func (c *UserCache) ID() string {
+//	    return "users"
+//	}
+//
+//	func (c *UserCache) VersionSQL() string {
+//	    // Must return a single row with a column named "version"
+//	    return `SELECT MD5(CAST((ARRAY_AGG(t.* ORDER BY t)) AS text)) AS version
+//	            FROM users t`
+//	}
+//
+//	func (c *UserCache) RowSQL() string {
+//	    // Column names must match struct field names (case-insensitive)
+//	    return "SELECT id, name, email FROM users"
+//	}
+//
+//	func (c *UserCache) Reset(rows pgx.Rows) error {
+//	    users, err := pgx.CollectRows(rows, pgx.RowToStructByName[User])
+//	    if err != nil {
+//	        return err
+//	    }
+//	    // Convert to map and store atomically
+//	    userMap := make(map[int]User)
+//	    for _, user := range users {
+//	        userMap[user.ID] = user
+//	    }
+//	    c.users.SetAll(userMap)
+//	    return nil
+//	}
 type Cache interface {
+	// ID returns a unique identifier for this cache.
+	// This is used for logging and internal tracking.
 	ID() string
+
+	// VersionSQL returns a SQL query that produces a single row with a single column
+	// named "version". The version value should change whenever the underlying data
+	// changes. A common approach is to use MD5 hashing of all rows:
+	//
+	//   SELECT MD5(CAST((ARRAY_AGG(t.* ORDER BY t)) AS text)) AS version FROM table_name t
+	//
+	// The column MUST be named "version" (case-insensitive).
 	VersionSQL() string
+
+	// RowSQL returns a SQL query that fetches all rows to be cached.
+	// Column names in the SELECT clause must match your struct field names
+	// (case-insensitive) for pgx.RowToStructByName to work correctly.
 	RowSQL() string
+
+	// Reset is called when the cache needs to be rebuilt with fresh data.
+	// This method MUST be thread-safe as it will be called concurrently with
+	// reads from your cache data structure.
+	//
+	// The rows parameter contains the result of executing RowSQL().
+	// You should:
+	// 1. Collect the rows into your data structure
+	// 2. Update your cache atomically (using mutexes or SafeMap)
+	// 3. Return any errors that occur
+	//
+	// If Reset returns an error, the cache version will NOT be updated,
+	// and the refresh will be retried on the next cycle.
 	Reset(pgx.Rows) error
 }
 
@@ -31,106 +167,128 @@ type CachedVersionContainer struct {
 }
 
 type Registry struct {
+	mu                      sync.RWMutex
 	cachedVersionContainers map[string]CachedVersionContainer
 	caches                  []Cache
 	done                    chan struct{}
 	conn                    *pgx.Conn
+	logger                  *slog.Logger
 }
 
-type CacheVersion struct {
-	Version string
-}
-
-func (r *Registry) rebuildCache(cache Cache, version string) {
+func (r *Registry) rebuildCache(ctx context.Context, cache Cache, version string) error {
 	// fetch all rows
-	rows, err := r.conn.Query(context.Background(), cache.RowSQL())
+	rows, err := r.conn.Query(ctx, cache.RowSQL())
 	if err != nil {
-		fmt.Println("Error querying cache rows for cache ID:", cache.ID(), "error:", err)
-		return
+		r.logger.Error("error querying cache rows", "cache_id", cache.ID(), "error", err)
+		return fmt.Errorf("error querying cache rows for cache ID %s: %w", cache.ID(), err)
 	}
 	defer rows.Close()
 
-	// TODO: We may want to retry this
 	err = cache.Reset(rows)
 	if err != nil {
-		fmt.Println("Error resetting cache for cache ID:", cache.ID(), "error:", err)
-		return
+		r.logger.Error("error resetting cache", "cache_id", cache.ID(), "error", err)
+		return fmt.Errorf("error resetting cache for cache ID %s: %w", cache.ID(), err)
 	}
 
 	// Update the cached version
+	r.mu.Lock()
 	r.cachedVersionContainers[cache.ID()] = CachedVersionContainer{
 		Version: version,
 		Cache:   cache,
 	}
+	r.mu.Unlock()
+
+	return nil
 }
 
-func (r *Registry) refreshCache(cache Cache) {
+func (r *Registry) refreshCache(ctx context.Context, cache Cache) error {
 	var version string
 	// get the single version row
-	rows := r.conn.QueryRow(context.Background(), cache.VersionSQL())
+	rows := r.conn.QueryRow(ctx, cache.VersionSQL())
 	err := rows.Scan(&version)
 	if err != nil {
-		fmt.Println("Error scanning cache version for cache ID:", cache.ID(), "error:", err)
-		return
+		r.logger.Error("error scanning cache version", "cache_id", cache.ID(), "error", err)
+		return fmt.Errorf("error scanning cache version for cache ID %s: %w", cache.ID(), err)
 	}
 
-	fmt.Println("Cache ID:", cache.ID(), "has version:", version)
+	r.logger.Debug("cache version check", "cache_id", cache.ID(), "version", version)
 
+	r.mu.RLock()
 	currentCachedVersionContainer, exists := r.cachedVersionContainers[cache.ID()]
+	r.mu.RUnlock()
 
 	// check if we need to refresh
 	if !exists || currentCachedVersionContainer.Version != version {
-		fmt.Println("Cache ID:", cache.ID(), "is stale or missing, refreshing...", exists, "current version:", currentCachedVersionContainer.Version, "new version:", version)
+		r.logger.Info("cache is stale, refreshing", "cache_id", cache.ID(), "current_version", currentCachedVersionContainer.Version, "new_version", version)
 
-		r.rebuildCache(cache, version)
+		err := r.rebuildCache(ctx, cache, version)
+		if err != nil {
+			return err
+		}
 
-		fmt.Println("Cache ID:", cache.ID(), "refreshed successfully.")
+		r.logger.Info("cache refreshed successfully", "cache_id", cache.ID())
 	} else {
-		fmt.Println("Cache ID:", cache.ID(), "is up-to-date, no refresh needed.")
+		r.logger.Debug("cache is up-to-date", "cache_id", cache.ID())
 	}
+
+	return nil
 }
 
-// startTime is passed for metrics
-func (r *Registry) RefreshCache(startTime time.Time) {
-	timeSinceStart := time.Since(startTime)
-	for _, cache := range r.caches {
-		fmt.Println("Refreshing cache ID:", cache.ID())
-		r.refreshCache(cache)
-		fmt.Println("Refreshing cache ID COMPLETE:", cache.ID())
+// RefreshCache refreshes all registered caches by checking their versions
+// and rebuilding them if they are stale.
+func (r *Registry) RefreshCache(ctx context.Context) {
+	cycleStart := time.Now()
+
+	r.mu.RLock()
+	caches := make([]Cache, len(r.caches))
+	copy(caches, r.caches)
+	r.mu.RUnlock()
+
+	for _, cache := range caches {
+		r.logger.Debug("refreshing cache", "cache_id", cache.ID())
+		err := r.refreshCache(ctx, cache)
+		if err != nil {
+			r.logger.Error("error refreshing cache", "cache_id", cache.ID(), "error", err)
+			continue
+		}
+		r.logger.Debug("cache refresh complete", "cache_id", cache.ID())
 	}
-	fmt.Println("Refreshing cache, time since start:", timeSinceStart)
+	r.logger.Debug("refresh cycle complete", "duration", time.Since(cycleStart))
 }
 
 func (r *Registry) AddCache(cache Cache) *Registry {
-	// TODO: mutexes
+	r.mu.Lock()
 	r.caches = append(r.caches, cache)
+	r.mu.Unlock()
 	return r
 }
 
-func (r *Registry) StopLoopGoRoutine() *Registry {
+func (r *Registry) StopLoopGoroutine() *Registry {
 	r.done <- struct{}{}
 	return r
 }
 
-func (r *Registry) StartLoopGoRoutine() *Registry {
+func (r *Registry) StartLoopGoroutine(ctx context.Context) *Registry {
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {
-				// TODO: Big error log and metric to monitor
-				fmt.Printf("Recovered in Registry loop goroutine, we should have crashed at this point %#v\n", rec)
+				r.logger.Error("panic in registry loop, shutting down", "panic", rec)
+				// After a panic, we exit the goroutine to fail-fast
+				// rather than continuing in a potentially corrupted state
 			}
 		}()
 
-		startTime := time.Now()
-
 		for {
-			r.RefreshCache(startTime)
-			fmt.Println("sleeping for 1 minute in Registry loop goroutine...")
+			r.RefreshCache(ctx)
+			r.logger.Debug("sleeping before next refresh cycle", "interval", DefaultRefreshInterval)
 			select {
-			case <-r.done:
-				fmt.Println("stopping Registry loop goroutine as requested")
+			case <-ctx.Done():
+				r.logger.Info("stopping registry loop due to context cancellation")
 				return
-			case <-time.After(10 * time.Second):
+			case <-r.done:
+				r.logger.Info("stopping registry loop as requested")
+				return
+			case <-time.After(DefaultRefreshInterval):
 				continue
 			}
 		}

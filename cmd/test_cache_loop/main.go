@@ -11,7 +11,7 @@ import (
 )
 
 type PricingPlanCache struct {
-	Plans map[int]PricingPlan
+	Plans *core.SafeMap[int, PricingPlan]
 }
 
 type PricingPlan struct {
@@ -34,12 +34,11 @@ func (p *PricingPlanCache) Reset(rows pgx.Rows) error {
 		return err
 	}
 
-	// TODO: mutex
 	plansMap := make(map[int]PricingPlan)
 	for _, plan := range plans {
 		plansMap[plan.ID] = *plan
 	}
-	p.Plans = plansMap
+	p.Plans.SetAll(plansMap)
 
 	fmt.Printf("Pricing Plans in Cache: %#v\n", plans)
 
@@ -57,28 +56,29 @@ func (p *PricingPlanCache) VersionSQL() string {
 
 func (p *PricingPlanCache) RowSQL() string {
 	return "SELECT id, name FROM pricing_plans"
-	// return "SELECT id, name, price, created_at FROM pricing_plans"
 }
 
-// TODO: Put this in a wrapper which manages updates using mutexes
 var _ core.Cache = &PricingPlanCache{}
 
 func main() {
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close(context.Background())
+	defer conn.Close(ctx)
 
-	ppc := &PricingPlanCache{}
-	r := core.NewRegistry(conn).
+	ppc := &PricingPlanCache{
+		Plans: core.NewSafeMap[int, PricingPlan](),
+	}
+	r := core.NewRegistry(conn, nil).
 		AddCache(ppc).
-		StartLoopGoRoutine()
+		StartLoopGoroutine(ctx)
 
 	go func() {
 		for {
-			thirdPlan, ok := ppc.Plans[3]
+			thirdPlan, ok := ppc.Plans.Get(3)
 			fmt.Println(">> Fetched plan with ID 3:", thirdPlan, "found:", ok)
 			time.Sleep(3 * time.Second)
 		}
@@ -88,5 +88,5 @@ func main() {
 	time.Sleep(10 * time.Minute)
 
 	fmt.Println("main loop is exiting now, so stopping registry")
-	r.StopLoopGoRoutine()
+	r.StopLoopGoroutine()
 }
