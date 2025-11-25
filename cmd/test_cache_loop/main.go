@@ -33,42 +33,58 @@ func (p *PricingPlan) String() string {
 // This is what you had to do before - lots of boilerplate!
 // Keeping this commented out to show the improvement.
 //
-// type PricingPlanCache struct {
-//     Plans *core.SafeMap[int, PricingPlan]
-// }
+//	type PricingPlanCache struct {
+//	    Plans *core.SafeMap[int, PricingPlan]
+//	}
 //
-// func (p *PricingPlanCache) ID() string {
-//     return "pricing_plan_cache"
-// }
+//	func (p *PricingPlanCache) ID() string {
+//	    return "pricing_plan_cache"
+//	}
 //
-// func (p *PricingPlanCache) Reset(rows pgx.Rows) error {
-//     plans, err := pgx.CollectRows(rows, pgx.RowToAddrOfStructByName[PricingPlan])
-//     if err != nil {
-//         fmt.Println("Error collecting pricing plans:", err)
-//         return err
-//     }
+//	func (p *PricingPlanCache) Reset(rows pgx.Rows) error {
+//	    plans, err := pgx.CollectRows(rows, pgx.RowToAddrOfStructByName[PricingPlan])
+//	    if err != nil {
+//	        fmt.Println("Error collecting pricing plans:", err)
+//	        return err
+//	    }
 //
-//     plansMap := make(map[int]PricingPlan)
-//     for _, plan := range plans {
-//         plansMap[plan.ID] = *plan
-//     }
-//     p.Plans.SetAll(plansMap)
+//	    plansMap := make(map[int]PricingPlan)
+//	    for _, plan := range plans {
+//	        plansMap[plan.ID] = *plan
+//	    }
+//	    p.Plans.SetAll(plansMap)
 //
-//     fmt.Printf("Pricing Plans in Cache: %#v\n", plans)
-//     return nil
-// }
+//	    fmt.Printf("Pricing Plans in Cache: %#v\n", plans)
+//	    return nil
+//	}
 //
-// func (p *PricingPlanCache) VersionSQL() string {
-//     return `SELECT
-//         MD5(CAST((ARRAY_AGG(t.* ORDER BY t)) AS text)) version
-//         FROM pricing_plans t;`
-// }
+//	func (p *PricingPlanCache) VersionSQL() string {
+//	    return `SELECT
+//	        MD5(CAST((ARRAY_AGG(t.* ORDER BY t)) AS text)) version
+//	        FROM pricing_plans t;`
+//	}
 //
-// func (p *PricingPlanCache) RowSQL() string {
-//     return "SELECT id, name FROM pricing_plans"
-// }
+//	func (p *PricingPlanCache) RowSQL() string {
+//	    return "SELECT id, name FROM pricing_plans"
+//	}
 //
 // var _ core.Cache = &PricingPlanCache{}
+
+type RealmKey struct {
+	ID        int
+	CountryID int
+}
+
+type Realm struct {
+	ID        int
+	CountryID int
+	Name      string
+	CreatedAt time.Time
+}
+
+func (r *Realm) String() string {
+	return fmt.Sprintf("Realm{ID: %d, Name: %s, CreatedAt: %s}", r.ID, r.Name, r.CreatedAt)
+}
 
 func main() {
 	ctx := context.Background()
@@ -92,15 +108,22 @@ func main() {
 		return p.ID
 	}).WithColumns("id", "name") // Optional: specify columns (otherwise uses SELECT *)
 
+	realmsCache := core.NewSQLCache("realms", func(r Realm) RealmKey {
+		return RealmKey{ID: r.ID, CountryID: r.CountryID} // Example composite key
+	})
+
 	// Add the cache to the registry and start the refresh loop
 	r := core.NewRegistry(conn, nil).
 		AddCache(pricingPlansCache).
+		AddCache(realmsCache).
 		StartLoopGoroutine(ctx)
 
 	// Access cached data thread-safely using Get()
 	go func() {
 		for {
+			r, rFound := realmsCache.Get(RealmKey{ID: 2, CountryID: 44})
 			plan, found := pricingPlansCache.Get(3)
+			fmt.Println(">> Fetched realm with ID 1:", r, "found:", rFound)
 			fmt.Println(">> Fetched plan with ID 3:", plan, "found:", found)
 			time.Sleep(3 * time.Second)
 		}

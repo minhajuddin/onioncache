@@ -26,6 +26,7 @@ type SafeMap[K comparable, V any] struct {
 func NewSafeMap[K comparable, V any]() *SafeMap[K, V] {
 	return &SafeMap[K, V]{
 		data: make(map[K]V),
+		mu:   sync.RWMutex{},
 	}
 }
 
@@ -91,13 +92,13 @@ func (sm *SafeMap[K, V]) Len() int {
 //	// Access data thread-safely
 //	user, ok := userCache.Get(123)
 type SQLCache[K comparable, V any] struct {
-	tableName   string
-	cacheID     string
-	keyFunc     func(V) K
-	data        *SafeMap[K, V]
-	columns     []string
-	versionSQL  string
-	rowSQL      string
+	tableName  string
+	cacheID    string
+	keyFunc    func(V) K
+	data       *SafeMap[K, V]
+	columns    []string
+	versionSQL string
+	rowSQL     string
 }
 
 // NewSQLCache creates a new generic SQL-backed cache.
