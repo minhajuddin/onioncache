@@ -71,6 +71,149 @@ func (sm *SafeMap[K, V]) Len() int {
 	return len(sm.data)
 }
 
+// SQLCache is a generic, ready-to-use cache implementation that eliminates boilerplate.
+// It automatically generates SQL queries and handles all the Cache interface requirements.
+//
+// Example usage:
+//
+//	type User struct {
+//	    ID   int
+//	    Name string
+//	    Email string
+//	}
+//
+//	// Create a cache with just the table name and key extractor
+//	userCache := core.NewSQLCache("users", func(u User) int { return u.ID })
+//
+//	// That's it! No need to implement Cache interface manually.
+//	registry.AddCache(userCache)
+//
+//	// Access data thread-safely
+//	user, ok := userCache.Get(123)
+type SQLCache[K comparable, V any] struct {
+	tableName   string
+	cacheID     string
+	keyFunc     func(V) K
+	data        *SafeMap[K, V]
+	columns     []string
+	versionSQL  string
+	rowSQL      string
+}
+
+// NewSQLCache creates a new generic SQL-backed cache.
+// tableName: the database table name
+// keyFunc: function to extract the key from a value (e.g., func(u User) int { return u.ID })
+//
+// The cache will automatically:
+// - Generate version SQL using MD5 hashing
+// - Generate row SQL by reflecting on the struct fields
+// - Handle thread-safe updates
+// - Implement the Cache interface
+func NewSQLCache[K comparable, V any](tableName string, keyFunc func(V) K) *SQLCache[K, V] {
+	cache := &SQLCache[K, V]{
+		tableName: tableName,
+		cacheID:   tableName + "_cache",
+		keyFunc:   keyFunc,
+		data:      NewSafeMap[K, V](),
+	}
+
+	// Generate the version SQL (MD5 hash of all rows)
+	cache.versionSQL = fmt.Sprintf(
+		`SELECT MD5(CAST((ARRAY_AGG(t.* ORDER BY t)) AS text)) AS version FROM %s t`,
+		tableName,
+	)
+
+	// Generate row SQL by inspecting the struct type
+	// We'll use SELECT * for simplicity and let pgx handle the mapping
+	cache.rowSQL = fmt.Sprintf("SELECT * FROM %s", tableName)
+
+	return cache
+}
+
+// WithColumns allows specifying which columns to select instead of SELECT *.
+// This is useful for excluding large columns or selecting specific fields.
+//
+// Example:
+//
+//	cache := NewSQLCache("users", func(u User) int { return u.ID }).
+//	    WithColumns("id", "name", "email")
+func (c *SQLCache[K, V]) WithColumns(columns ...string) *SQLCache[K, V] {
+	c.columns = columns
+	if len(columns) > 0 {
+		columnList := ""
+		for i, col := range columns {
+			if i > 0 {
+				columnList += ", "
+			}
+			columnList += col
+		}
+		c.rowSQL = fmt.Sprintf("SELECT %s FROM %s", columnList, c.tableName)
+	}
+	return c
+}
+
+// WithID allows customizing the cache ID (defaults to tableName + "_cache").
+func (c *SQLCache[K, V]) WithID(id string) *SQLCache[K, V] {
+	c.cacheID = id
+	return c
+}
+
+// ID implements the Cache interface.
+func (c *SQLCache[K, V]) ID() string {
+	return c.cacheID
+}
+
+// VersionSQL implements the Cache interface.
+func (c *SQLCache[K, V]) VersionSQL() string {
+	return c.versionSQL
+}
+
+// RowSQL implements the Cache interface.
+func (c *SQLCache[K, V]) RowSQL() string {
+	return c.rowSQL
+}
+
+// Reset implements the Cache interface.
+func (c *SQLCache[K, V]) Reset(rows pgx.Rows) error {
+	// Collect all rows into a slice
+	values, err := pgx.CollectRows(rows, pgx.RowToStructByName[V])
+	if err != nil {
+		return fmt.Errorf("failed to collect rows: %w", err)
+	}
+
+	// Convert slice to map using the key function
+	dataMap := make(map[K]V, len(values))
+	for _, value := range values {
+		key := c.keyFunc(value)
+		dataMap[key] = value
+	}
+
+	// Update the cache atomically
+	c.data.SetAll(dataMap)
+
+	return nil
+}
+
+// Get retrieves a value from the cache by key (thread-safe).
+func (c *SQLCache[K, V]) Get(key K) (V, bool) {
+	return c.data.Get(key)
+}
+
+// GetAll returns a copy of all cached data (thread-safe).
+func (c *SQLCache[K, V]) GetAll() map[K]V {
+	return c.data.GetAll()
+}
+
+// Len returns the number of items in the cache (thread-safe).
+func (c *SQLCache[K, V]) Len() int {
+	return c.data.Len()
+}
+
+// Data returns the underlying SafeMap for advanced use cases.
+func (c *SQLCache[K, V]) Data() *SafeMap[K, V] {
+	return c.data
+}
+
 // NewRegistry creates a new cache registry.
 // If logger is nil, a default logger will be used.
 func NewRegistry(c *pgx.Conn, logger *slog.Logger) *Registry {
